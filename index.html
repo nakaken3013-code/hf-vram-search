@@ -39,6 +39,7 @@
   th { color: #9aa; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #0f1115; }
   th:hover { color: #fff; }
   td.name { white-space: normal; max-width: 320px; }
+  td.tags-cell { white-space: normal; max-width: 200px; line-height: 1.6; }
   td.name a { color: #7db2ff; text-decoration: none; }
   td.name a:hover { text-decoration: underline; }
   .tag { display: inline-block; background: #23262f; color: #9aa; border-radius: 4px; padding: 1px 6px; font-size: .7rem; margin: 1px 2px 1px 0; }
@@ -356,6 +357,7 @@ function render() {
     tr.appendChild(tdName);
 
     const tdTags = document.createElement("td");
+    tdTags.className = "tags-cell";
     tdTags.innerHTML = row.tags.map(t => `<span class="tag">${t}</span>`).join("");
     tr.appendChild(tdTags);
 
