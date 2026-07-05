@@ -69,7 +69,7 @@
   <div class="row">
     <div>
       <label>キーワード検索</label>
-      <input type="text" id="kw" placeholder="例: gemma, swallow, awq gemma..." value="japanese awq">
+      <input type="text" id="kw" placeholder="スペース区切りで全部AND一致(例: 3.6 27B)" value="japanese awq">
     </div>
     <div>
       <label>件数</label>
@@ -197,24 +197,60 @@ function verdict(totalGb, safeGb, marginalGb) {
 
 function setStatus(msg) { document.getElementById("status").textContent = msg; }
 
+function buildSearchParams(searchTerm, fetchLimit, sortby) {
+  const params = new URLSearchParams();
+  if (searchTerm) params.set("search", searchTerm);
+  params.set("limit", String(fetchLimit));
+  if (sortby === "downloads") { params.set("sort", "downloads"); params.set("direction", "-1"); }
+  else if (sortby === "trending") { params.set("sort", "trendingScore"); params.set("direction", "-1"); }
+  else { params.set("sort", "lastModified"); params.set("direction", "-1"); }
+  params.set("full", "true");
+  return params;
+}
+
 async function searchModels() {
   const kw = document.getElementById("kw").value.trim();
   const limit = parseInt(document.getElementById("limit").value, 10) || 40;
   const sortby = document.getElementById("sortby").value;
+  const terms = kw.split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
   setStatus("検索中…");
   document.getElementById("searchBtn").disabled = true;
   try {
-    const params = new URLSearchParams();
-    if (kw) params.set("search", kw);
-    params.set("limit", String(limit));
-    if (sortby === "downloads") { params.set("sort", "downloads"); params.set("direction", "-1"); }
-    else if (sortby === "trending") { params.set("sort", "trendingScore"); params.set("direction", "-1"); }
-    else { params.set("sort", "lastModified"); params.set("direction", "-1"); }
-    params.set("full", "true");
+    // HFのsearchは複数語をAND条件で扱ってくれない(緩いマッチ)ので、
+    // 広めに取得してから「全キーワードがモデル名に含まれる」でクライアント側AND絞り込みする。
+    const fetchLimit = terms.length > 1 ? Math.max(limit * 6, 200) : limit;
+    const seen = new Map();
 
-    const res = await fetch(`${API}?${params.toString()}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    async function runQuery(searchTerm) {
+      const params = buildSearchParams(searchTerm, fetchLimit, sortby);
+      const res = await fetch(`${API}?${params.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      for (const m of data) {
+        const id = m.modelId || m.id;
+        if (!seen.has(id)) seen.set(id, m);
+      }
+    }
+
+    await runQuery(kw);
+    // 複数語の場合、各語単体でも追加検索してプールを広げる(HF検索がフルフレーズで
+    // 見つけられないケースを補う。例: "3.6 27B" では見つからないが "27B" 単体なら見つかる等)
+    if (terms.length > 1) {
+      for (const t of terms) {
+        await runQuery(t);
+      }
+    }
+
+    let data = Array.from(seen.values());
+    if (terms.length > 1) {
+      data = data.filter(m => {
+        const hay = (m.modelId || m.id).toLowerCase();
+        return terms.every(t => hay.includes(t));
+      });
+    }
+    data.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
+    data = data.slice(0, limit);
+
     results = data.map(m => ({
       id: m.modelId || m.id,
       tags: (m.tags || []).filter(t => !t.startsWith("region:") && !t.startsWith("license:")).slice(0, 8),
