@@ -23,6 +23,9 @@
   }
   input[type=text] { width: 220px; }
   input[type=number] { width: 90px; }
+  .checkrow { display: flex; align-items: center; gap: .4rem; }
+  .checkrow input[type=checkbox] { width: auto; }
+  .checkrow label { margin: 0; }
   button {
     background: #3b6ef0; color: white; border: none; border-radius: 6px;
     padding: .5rem 1.1rem; font-size: .9rem; cursor: pointer; font-weight: 600;
@@ -35,7 +38,7 @@
   th, td { padding: .5rem .6rem; text-align: left; border-bottom: 1px solid #23262f; white-space: nowrap; }
   th { color: #9aa; font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: #0f1115; }
   th:hover { color: #fff; }
-  td.name { white-space: normal; max-width: 340px; }
+  td.name { white-space: normal; max-width: 320px; }
   td.name a { color: #7db2ff; text-decoration: none; }
   td.name a:hover { text-decoration: underline; }
   .tag { display: inline-block; background: #23262f; color: #9aa; border-radius: 4px; padding: 1px 6px; font-size: .7rem; margin: 1px 2px 1px 0; }
@@ -48,8 +51,10 @@
   #status { color: #9aa; font-size: .82rem; margin: .5rem 0; min-height: 1.2em; }
   .fetchbtn { background: #23262f; color: #ccc; border: 1px solid #333947; font-size: .75rem; padding: .2rem .55rem; border-radius: 5px; cursor: pointer; }
   .fetchbtn:hover { background: #2f3340; }
-  .spin { display: inline-block; animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  .badge { display: inline-block; font-size: .68rem; padding: 1px 6px; border-radius: 4px; margin-left: 4px; white-space: normal; }
+  .badge-gdn { background: #143a2e; color: #5fe0b0; }
+  .badge-sw { background: #2e2a10; color: #e0c85f; }
+  .ctxcell { white-space: normal; max-width: 220px; }
   .footer-note { color: #666; font-size: .75rem; margin-top: 2rem; line-height: 1.6; }
   code { background: #23262f; padding: 1px 5px; border-radius: 4px; }
 </style>
@@ -57,7 +62,7 @@
 <body>
 
 <h1>HF VRAM適合サーチ</h1>
-<div class="sub">HuggingFace Hub APIを直接叩いて実ファイルサイズを取得し、手元のGPU構成に収まるか判定するツール(ブラウザから直接、サーバー経由なし)</div>
+<div class="sub">HuggingFace Hub APIを直接叩いて実ファイルサイズ・アーキテクチャを取得し、手元のGPU構成に収まるか/どれだけコンテキストが取れるかを推定するツール(ブラウザから直接、サーバー経由なし)</div>
 
 <div class="panel">
   <div class="row">
@@ -89,6 +94,10 @@
       <input type="number" id="ceiling" value="10.6" step="0.1" min="1">
     </div>
     <div>
+      <label>固定オーバーヘッド(GiB)</label>
+      <input type="number" id="overhead" value="0.9" step="0.1" min="0">
+    </div>
+    <div>
       <label>安全圏しきい値(合計GB)</label>
       <input type="number" id="safeGb" value="16" step="0.5">
     </div>
@@ -96,7 +105,21 @@
       <label>境界しきい値(合計GB)</label>
       <input type="number" id="marginalGb" value="18" step="0.5">
     </div>
-    <div><button class="secondary" id="fetchAllSizes" disabled>表示中の全件サイズ取得</button></div>
+    <div><button class="secondary" id="fetchAllSizes" disabled>表示中の全件サイズ+コンテキスト取得</button></div>
+  </div>
+  <div class="row" style="margin-top:.8rem;">
+    <div class="checkrow">
+      <input type="checkbox" id="kvarn">
+      <label for="kvarn">KVarN(k4v2)適用時も計算</label>
+    </div>
+    <div>
+      <label>KVarN圧縮率(既定 k4v2: 3/16 ≈ 0.1875)</label>
+      <input type="number" id="kvarnRatio" value="0.1875" step="0.01" min="0.01" max="1">
+    </div>
+    <div>
+      <label>KVキャッシュdtype(baseline, byte/値)</label>
+      <input type="number" id="kvdtype" value="2" step="1" min="1" max="4">
+    </div>
   </div>
   <div id="status"></div>
 </div>
@@ -111,6 +134,8 @@
         <th data-key="sizeGb">実容量(GB)</th>
         <th data-key="perGpu">/GPU(GiB)</th>
         <th data-key="verdictRank">判定</th>
+        <th data-key="ctxTokens">推定コンテキスト(標準アテンション換算)</th>
+        <th data-key="ctxTokensKvarn">KVarN適用時</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -118,10 +143,17 @@
 </div>
 
 <div class="footer-note">
-  判定基準(既定値、上のフォームで調整可): 合計実容量が「安全圏しきい値」以下=安全、「境界しきい値」以下=境界、それ以上=却下相当。<br>
+  容量判定基準(既定値、上のフォームで調整可): 合計実容量が「安全圏しきい値」以下=安全、「境界しきい値」以下=境界、それ以上=却下相当。<br>
   /GPU値は 合計実容量 ÷ TP数(単純折半、実際はレイヤーの重複等でズレることがあるため目安)。<br>
-  容量は各モデルの <code>/api/models/&lt;repo&gt;/tree/main</code> を個別に叩いて実ファイルサイズを合算(重み以外の小さい設定ファイルも含む合計)。<br>
-  一覧表示は <code>/api/models?search=...</code> のメタデータのみで高速表示、サイズは「サイズ取得」ボタンで遅延取得(全件一括取得も可)。
+  <b>コンテキスト推定の計算式</b>: config.jsonから num_hidden_layers・num_attention_heads・num_key_value_heads(GQA、無ければ num_attention_heads と同じ)・hidden_size を取得し、<br>
+  <code>1トークンあたりのKVバイト数(全GPU合計) = 2(K+V) × layers × kv_heads × head_dim × dtypeバイト数</code>、これをTPで割って1GPUあたりに換算。<br>
+  <code>KV予算(GiB) = VRAM上限 − 重み(/GPU) − 固定オーバーヘッド</code>、<code>推定最大トークン数 = KV予算 ÷ (1トークンあたりのKVバイト数/GPU)</code>。<br>
+  この式は「全layerが標準アテンション」という仮定なので、<span class="badge badge-sw">sliding window検出</span>のモデルは実際はこれより多く入り、
+  <span class="badge badge-gdn">GDN/線形アテンション検出</span>のモデルはKVコストがほぼゼロなのでこの計算は全く当てはまらず、実際はケタ違いに大きいコンテキストが可能。<br>
+  KVarN(k4v2)適用時は、この標準アテンション換算値に圧縮率(既定3/16)を掛けただけの単純推定であり、実機では固定オーバーヘッドや sliding window 層が対象外である影響で、
+  短いコンテキストではむしろ悪化するケースが実測で確認されています(このツールの数値はあくまで目安、必ず実機検証してください)。<br>
+  容量・アーキテクチャは各モデルの <code>/api/models/&lt;repo&gt;/tree/main</code> と <code>/&lt;repo&gt;/raw/main/config.json</code> を個別に叩いて取得。
+  一覧表示は <code>/api/models?search=...</code> のメタデータのみで高速表示、詳細は「サイズ取得」ボタンで遅延取得。
 </div>
 
 <script>
@@ -134,6 +166,13 @@ function fmtNum(n) {
   if (n >= 1e6) return (n/1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n/1e3).toFixed(1) + "k";
   return String(n);
+}
+
+function fmtTokens(n) {
+  if (n == null) return "-";
+  if (n <= 0) return "0(不可)";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + "k";
+  return String(Math.floor(n));
 }
 
 function verdict(totalGb, safeGb, marginalGb) {
@@ -170,9 +209,14 @@ async function searchModels() {
       sizeGb: null,
       perGpu: null,
       verdictRank: -1,
+      bytesPerTokenPerGpu: null,
+      ctxTokens: null,
+      ctxTokensKvarn: null,
+      archBadges: [],
+      configError: false,
     }));
     render();
-    setStatus(`${results.length}件取得。サイズは「サイズ取得」ボタンで個別/一括取得してください。`);
+    setStatus(`${results.length}件取得。サイズ・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
     document.getElementById("fetchAllSizes").disabled = results.length === 0;
   } catch (e) {
     setStatus("検索失敗: " + e.message);
@@ -190,16 +234,77 @@ async function fetchSize(repoId) {
   return total / 1e9; // decimal GB, matches HF's own display convention
 }
 
+async function fetchConfig(repoId) {
+  const res = await fetch(`https://huggingface.co/${repoId}/raw/main/config.json`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+function analyzeConfig(cfg) {
+  // returns { bytesPerTokenTotal, badges }
+  const raw = JSON.stringify(cfg).toLowerCase();
+  const badges = [];
+  if (/sliding_window|swa/.test(raw)) badges.push({ cls: "badge-sw", label: "sliding window検出" });
+  if (/linear_attention|delta_net|gated_delta|mamba|conv_kernel|linear_key|linear_value/.test(raw)) {
+    badges.push({ cls: "badge-gdn", label: "GDN/線形アテンション検出" });
+  }
+
+  const numLayers = cfg.num_hidden_layers || cfg.n_layer || cfg.num_layers ||
+    (cfg.text_config && (cfg.text_config.num_hidden_layers)) || null;
+  const hiddenSize = cfg.hidden_size || cfg.n_embd || cfg.d_model ||
+    (cfg.text_config && cfg.text_config.hidden_size) || null;
+  const numAttnHeads = cfg.num_attention_heads || cfg.n_head ||
+    (cfg.text_config && cfg.text_config.num_attention_heads) || null;
+  const numKvHeads = cfg.num_key_value_heads ||
+    (cfg.text_config && cfg.text_config.num_key_value_heads) || numAttnHeads;
+  const headDim = cfg.head_dim ||
+    (cfg.text_config && cfg.text_config.head_dim) ||
+    (hiddenSize && numAttnHeads ? hiddenSize / numAttnHeads : null);
+
+  if (!numLayers || !numKvHeads || !headDim) {
+    return { bytesPerTokenTotal: null, badges };
+  }
+  return {
+    bytesPerTokenTotal: 2 * numLayers * numKvHeads * headDim, // ×dtypeバイト数は呼び出し側で掛ける
+    badges,
+  };
+}
+
 async function fetchOne(idx) {
   const tp = parseFloat(document.getElementById("tp").value) || 2;
+  const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
+  const overhead = parseFloat(document.getElementById("overhead").value) || 0;
   const safeGb = parseFloat(document.getElementById("safeGb").value);
   const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const kvarnRatio = parseFloat(document.getElementById("kvarnRatio").value) || 0.1875;
+  const dtypeBytes = parseFloat(document.getElementById("kvdtype").value) || 2;
   const row = results[idx];
+
   try {
     const gb = await fetchSize(row.id);
     row.sizeGb = gb;
-    row.perGpu = (gb / tp) * (1e9 / (1024**3)); // convert decimal GB -> GiB per GPU
+    const perGpuGiB = (gb / tp) * (1e9 / (1024 ** 3));
+    row.perGpu = perGpuGiB;
     row.verdictRank = verdict(gb, safeGb, marginalGb).rank;
+
+    const kvBudgetGiB = ceiling - perGpuGiB - overhead;
+    try {
+      const cfg = await fetchConfig(row.id);
+      const { bytesPerTokenTotal, badges } = analyzeConfig(cfg);
+      row.archBadges = badges;
+      if (bytesPerTokenTotal) {
+        const bytesPerTokenPerGpu = (bytesPerTokenTotal * dtypeBytes) / tp;
+        row.bytesPerTokenPerGpu = bytesPerTokenPerGpu;
+        const kvBudgetBytes = kvBudgetGiB * (1024 ** 3);
+        row.ctxTokens = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / bytesPerTokenPerGpu) : 0;
+        row.ctxTokensKvarn = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / (bytesPerTokenPerGpu * kvarnRatio)) : 0;
+      } else {
+        row.ctxTokens = null;
+        row.ctxTokensKvarn = null;
+      }
+    } catch (e) {
+      row.configError = true;
+    }
   } catch (e) {
     row.sizeGb = -1; // marks fetch error
   }
@@ -211,13 +316,13 @@ async function fetchAll() {
   let done = 0;
   for (let i = 0; i < results.length; i++) {
     if (results[i].sizeGb == null) {
-      setStatus(`サイズ取得中… ${done}/${results.length}`);
+      setStatus(`サイズ・コンテキスト取得中… ${done}/${results.length}`);
       await fetchOne(i);
       done++;
-      await new Promise(r => setTimeout(r, 120)); // gentle pacing, avoid hammering the API
+      await new Promise(r => setTimeout(r, 150)); // gentle pacing, avoid hammering the API
     }
   }
-  setStatus(`完了: ${results.length}件のサイズ取得を試行しました。`);
+  setStatus(`完了: ${results.length}件の取得を試行しました。`);
   document.getElementById("fetchAllSizes").disabled = false;
 }
 
@@ -225,6 +330,8 @@ function render() {
   const tp = parseFloat(document.getElementById("tp").value) || 2;
   const safeGb = parseFloat(document.getElementById("safeGb").value);
   const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const showKvarn = document.getElementById("kvarn").checked;
+  document.querySelector('th[data-key="ctxTokensKvarn"]').style.display = showKvarn ? "" : "none";
 
   const sorted = [...results].sort((a, b) => {
     let av = a[sortState.key], bv = b[sortState.key];
@@ -244,7 +351,8 @@ function render() {
 
     const tdName = document.createElement("td");
     tdName.className = "name";
-    tdName.innerHTML = `<a href="https://huggingface.co/${row.id}" target="_blank" rel="noopener">${row.id}</a>`;
+    tdName.innerHTML = `<a href="https://huggingface.co/${row.id}" target="_blank" rel="noopener">${row.id}</a>` +
+      (row.archBadges || []).map(b => `<span class="badge ${b.cls}">${b.label}</span>`).join("");
     tr.appendChild(tdName);
 
     const tdTags = document.createElement("td");
@@ -282,6 +390,23 @@ function render() {
     }
     tr.appendChild(tdVerdict);
 
+    const tdCtx = document.createElement("td");
+    tdCtx.className = "ctxcell";
+    if (row.ctxTokens != null) {
+      tdCtx.textContent = fmtTokens(row.ctxTokens) + " tokens";
+    } else if (row.configError) {
+      tdCtx.innerHTML = `<span class="muted">config取得失敗</span>`;
+    } else {
+      tdCtx.innerHTML = `<span class="muted">-</span>`;
+    }
+    tr.appendChild(tdCtx);
+
+    const tdCtxKvarn = document.createElement("td");
+    tdCtxKvarn.className = "ctxcell";
+    tdCtxKvarn.style.display = showKvarn ? "" : "none";
+    tdCtxKvarn.textContent = row.ctxTokensKvarn != null ? fmtTokens(row.ctxTokensKvarn) + " tokens" : "-";
+    tr.appendChild(tdCtxKvarn);
+
     tbody.appendChild(tr);
   });
 }
@@ -298,11 +423,9 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","safeGb","marginalGb"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","safeGb","marginalGb","kvarn"].forEach(id => document.getElementById(id).addEventListener("change", render));
 
 searchModels();
 </script>
 </body>
 </html>
-<!-- redeploy trigger -->
-<!-- retry 1783250692 -->
