@@ -121,6 +121,14 @@
       <label>KVキャッシュdtype(baseline, byte/値)</label>
       <input type="number" id="kvdtype" value="2" step="1" min="1" max="4">
     </div>
+    <div class="checkrow">
+      <input type="checkbox" id="excludeGguf" checked>
+      <label for="excludeGguf">GGUFを除外(vLLMスループット劣る)</label>
+    </div>
+    <div class="checkrow">
+      <input type="checkbox" id="excludeMlx" checked>
+      <label for="excludeMlx">MLXを除外(Apple Silicon専用、CUDA非対応)</label>
+    </div>
   </div>
   <div id="status"></div>
 </div>
@@ -217,8 +225,8 @@ async function searchModels() {
       configError: false,
     }));
     render();
-    setStatus(`${results.length}件取得。サイズ・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
-    document.getElementById("fetchAllSizes").disabled = results.length === 0;
+    setStatus(`${results.length}件取得(表示${visibleResults().length}件)。サイズ・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
+    document.getElementById("fetchAllSizes").disabled = visibleResults().length === 0;
   } catch (e) {
     setStatus("検索失敗: " + e.message);
   } finally {
@@ -312,18 +320,33 @@ async function fetchOne(idx) {
   render();
 }
 
+function isExcludedFormat(row) {
+  const excludeGguf = document.getElementById("excludeGguf").checked;
+  const excludeMlx = document.getElementById("excludeMlx").checked;
+  const hay = (row.id + " " + (row.tags || []).join(" ")).toLowerCase();
+  if (excludeGguf && /(^|[^a-z])gguf([^a-z]|$)/.test(hay)) return true;
+  if (excludeMlx && /(^|[^a-z])mlx([^a-z]|$)/.test(hay)) return true;
+  return false;
+}
+
+function visibleResults() {
+  return results.filter(r => !isExcludedFormat(r));
+}
+
 async function fetchAll() {
   document.getElementById("fetchAllSizes").disabled = true;
+  const targets = visibleResults();
   let done = 0;
-  for (let i = 0; i < results.length; i++) {
+  for (const row of targets) {
+    const i = results.indexOf(row);
     if (results[i].sizeGb == null) {
-      setStatus(`サイズ・コンテキスト取得中… ${done}/${results.length}`);
+      setStatus(`サイズ・コンテキスト取得中… ${done}/${targets.length}`);
       await fetchOne(i);
       done++;
       await new Promise(r => setTimeout(r, 150)); // gentle pacing, avoid hammering the API
     }
   }
-  setStatus(`完了: ${results.length}件の取得を試行しました。`);
+  setStatus(`完了: ${targets.length}件の取得を試行しました。(GGUF/MLX除外設定を反映)`);
   document.getElementById("fetchAllSizes").disabled = false;
 }
 
@@ -334,7 +357,7 @@ function render() {
   const showKvarn = document.getElementById("kvarn").checked;
   document.querySelector('th[data-key="ctxTokensKvarn"]').style.display = showKvarn ? "" : "none";
 
-  const sorted = [...results].sort((a, b) => {
+  const sorted = [...visibleResults()].sort((a, b) => {
     let av = a[sortState.key], bv = b[sortState.key];
     if (sortState.key === "tags") { av = (a.tags||[]).join(","); bv = (b.tags||[]).join(","); }
     if (sortState.key === "id") { av = a.id; bv = b.id; }
@@ -425,7 +448,7 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","safeGb","marginalGb","kvarn"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx"].forEach(id => document.getElementById(id).addEventListener("change", render));
 
 searchModels();
 </script>
