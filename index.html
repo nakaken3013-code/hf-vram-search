@@ -129,6 +129,10 @@
       <input type="checkbox" id="excludeMlx" checked>
       <label for="excludeMlx">MLXを除外(Apple Silicon専用、CUDA非対応)</label>
     </div>
+    <div class="checkrow">
+      <input type="checkbox" id="hideDead" checked>
+      <label for="hideDead">容量オーバー(却下判定)のものを一覧から消す</label>
+    </div>
   </div>
   <div id="status"></div>
 </div>
@@ -330,7 +334,15 @@ function isExcludedFormat(row) {
 }
 
 function visibleResults() {
-  return results.filter(r => !isExcludedFormat(r));
+  const hideDead = document.getElementById("hideDead").checked;
+  const safeGb = parseFloat(document.getElementById("safeGb").value);
+  const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  return results.filter(r => {
+    if (isExcludedFormat(r)) return false;
+    // しきい値変更後も最新の判定でフィルタする(fetch時点のverdictRankは使わない)
+    if (hideDead && r.sizeGb != null && r.sizeGb >= 0 && verdict(r.sizeGb, safeGb, marginalGb).rank === 2) return false;
+    return true;
+  });
 }
 
 async function fetchAll() {
@@ -448,7 +460,7 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx","hideDead"].forEach(id => document.getElementById(id).addEventListener("change", render));
 
 searchModels();
 </script>
