@@ -482,7 +482,9 @@ async function fetchAll() {
   let done = 0;
   for (const row of targets) {
     const i = results.indexOf(row);
-    if (results[i].sizeGb == null) {
+    // sizeGb === -1 は前回失敗のマーク。再取得ボタンで毎回リトライできるよう、
+    // 「未取得」だけでなく「前回失敗」も対象に含める。
+    if (results[i].sizeGb == null || results[i].sizeGb < 0) {
       setStatus(`サイズ・コンテキスト取得中… ${done}/${targets.length}`);
       await fetchOne(i);
       done++;
