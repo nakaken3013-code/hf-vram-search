@@ -95,8 +95,21 @@
       <input type="number" id="ceiling" value="10.6" step="0.1" min="1">
     </div>
     <div>
+      <label>推論エンジン(オーバーヘッド既定値)</label>
+      <select id="engine">
+        <option value="0.9">vLLM enforce-eager (~0.9GiB)</option>
+        <option value="1.3">vLLM 通常 (~1.3GiB)</option>
+        <option value="1.5">SGLang (推定・実測少)</option>
+        <option value="custom">カスタム(下の値を直接編集)</option>
+      </select>
+    </div>
+    <div>
       <label>固定オーバーヘッド(GiB)</label>
       <input type="number" id="overhead" value="0.9" step="0.1" min="0">
+    </div>
+    <div>
+      <label>最小容量(GB、これ未満は除外)</label>
+      <input type="number" id="minGb" value="0" step="0.5" min="0">
     </div>
     <div>
       <label>安全圏しきい値(合計GB)</label>
@@ -107,6 +120,16 @@
       <input type="number" id="marginalGb" value="18" step="0.5">
     </div>
     <div><button class="secondary" id="fetchAllSizes" disabled>表示中の全件サイズ+コンテキスト取得</button></div>
+  </div>
+  <div class="row" style="margin-top:.8rem;">
+    <div>
+      <label>パラメータ数下限(B、任意)</label>
+      <input type="number" id="minParamsB" placeholder="例: 7" step="0.5" min="0">
+    </div>
+    <div>
+      <label>パラメータ数上限(B、任意)</label>
+      <input type="number" id="maxParamsB" placeholder="例: 40" step="0.5" min="0">
+    </div>
   </div>
   <div class="row" style="margin-top:.8rem;">
     <div class="checkrow">
@@ -145,6 +168,7 @@
         <th data-key="tags">タグ</th>
         <th data-key="downloads">DL数</th>
         <th data-key="sizeGb">実容量(GB)</th>
+        <th data-key="paramsB">パラメータ数(B)</th>
         <th data-key="perGpu">/GPU(GiB)</th>
         <th data-key="verdictRank">判定</th>
         <th data-key="ctxTokens">推定コンテキスト(標準アテンション換算)</th>
@@ -263,6 +287,7 @@ async function searchModels() {
       ctxTokensKvarn: null,
       archBadges: [],
       configError: false,
+      paramsB: null,
     }));
     render();
     setStatus(`${results.length}件取得(表示${visibleResults().length}件)。サイズ・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
@@ -287,6 +312,22 @@ async function fetchConfig(repoId) {
   const res = await fetch(`https://huggingface.co/${repoId}/raw/main/config.json`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return await res.json();
+}
+
+async function fetchParamsB(repoId) {
+  // HFのモデル情報APIにsafetensors.parameters(dtype別)/totalが入ってることがある(実測値)
+  try {
+    const res = await fetch(`${API}/${repoId}?expand[]=safetensors`);
+    if (res.ok) {
+      const info = await res.json();
+      const total = info?.safetensors?.total;
+      if (typeof total === "number" && total > 0) return total / 1e9;
+    }
+  } catch (e) { /* フォールバックへ */ }
+  // フォールバック: リポジトリ名から "7B" / "3.5B" 等のパターンを推定(不確実、参考値)
+  const m = repoId.match(/(\d+(?:\.\d+)?)\s*[Bb](?![a-zA-Z])/);
+  if (m) return parseFloat(m[1]);
+  return null;
 }
 
 function analyzeConfig(cfg) {
@@ -336,6 +377,10 @@ async function fetchOne(idx) {
     row.perGpu = perGpuGiB;
     row.verdictRank = verdict(gb, safeGb, marginalGb).rank;
 
+    try {
+      row.paramsB = await fetchParamsB(row.id);
+    } catch (e) { /* パラメータ数は取れなくても致命的ではない */ }
+
     const kvBudgetGiB = ceiling - perGpuGiB - overhead;
     try {
       const cfg = await fetchConfig(row.id);
@@ -373,10 +418,18 @@ function visibleResults() {
   const hideDead = document.getElementById("hideDead").checked;
   const safeGb = parseFloat(document.getElementById("safeGb").value);
   const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const minGb = parseFloat(document.getElementById("minGb").value) || 0;
+  const minParamsB = parseFloat(document.getElementById("minParamsB").value);
+  const maxParamsB = parseFloat(document.getElementById("maxParamsB").value);
   return results.filter(r => {
     if (isExcludedFormat(r)) return false;
     // しきい値変更後も最新の判定でフィルタする(fetch時点のverdictRankは使わない)
     if (hideDead && r.sizeGb != null && r.sizeGb >= 0 && verdict(r.sizeGb, safeGb, marginalGb).rank === 2) return false;
+    // 最小容量未満は除外(サイズ未取得のものは判定できないので通す)
+    if (minGb > 0 && r.sizeGb != null && r.sizeGb >= 0 && r.sizeGb < minGb) return false;
+    // パラメータ数の範囲外は除外(未取得のものは通す)
+    if (!isNaN(minParamsB) && r.paramsB != null && r.paramsB < minParamsB) return false;
+    if (!isNaN(maxParamsB) && r.paramsB != null && r.paramsB > maxParamsB) return false;
     return true;
   });
 }
@@ -450,6 +503,10 @@ function render() {
     }
     tr.appendChild(tdSize);
 
+    const tdParams = document.createElement("td");
+    tdParams.textContent = row.paramsB != null ? row.paramsB.toFixed(1) + "B" : "-";
+    tr.appendChild(tdParams);
+
     const tdPerGpu = document.createElement("td");
     tdPerGpu.textContent = row.perGpu != null ? row.perGpu.toFixed(2) + " GiB" : "-";
     tr.appendChild(tdPerGpu);
@@ -496,7 +553,14 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx","hideDead"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx","hideDead","minGb","minParamsB","maxParamsB"].forEach(id => document.getElementById(id).addEventListener("change", render));
+
+document.getElementById("engine").addEventListener("change", (e) => {
+  if (e.target.value !== "custom") {
+    document.getElementById("overhead").value = e.target.value;
+    render();
+  }
+});
 
 searchModels();
 </script>
