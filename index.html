@@ -185,8 +185,8 @@
   <b>コンテキスト推定の計算式</b>: config.jsonから num_hidden_layers・num_attention_heads・num_key_value_heads(GQA、無ければ num_attention_heads と同じ)・hidden_size を取得し、<br>
   <code>1トークンあたりのKVバイト数(全GPU合計) = 2(K+V) × layers × kv_heads × head_dim × dtypeバイト数</code>、これをTPで割って1GPUあたりに換算。<br>
   <code>KV予算(GiB) = VRAM上限 − 重み(/GPU) − 固定オーバーヘッド</code>、<code>推定最大トークン数 = KV予算 ÷ (1トークンあたりのKVバイト数/GPU)</code>。<br>
-  この式は「全layerが標準アテンション」という仮定なので、<span class="badge badge-sw">sliding window検出</span>のモデルは実際はこれより多く入り、
-  <span class="badge badge-gdn">GDN/線形アテンション検出</span>のモデルはKVコストがほぼゼロなのでこの計算は全く当てはまらず、実際はケタ違いに大きいコンテキストが可能。<br>
+  <span class="badge badge-gdn">GDN/線形アテンション検出</span>の場合、KVキャッシュがトークン数に比例して伸びるのは<code>layer_types</code>(または<code>full_attention_interval</code>)から数えたfull-attention層だけであり、この<code>layers</code>には全層数ではなくfull-attention層数を使う(バッジに「full-attn X/Y層」と表示)。この判定ができない場合はコンテキスト推定不可として「-」表示。<br>
+  <span class="badge badge-sw">sliding window検出</span>のモデルは実際はこの推定より多く入る場合がある(未補正)。<br>
   KVarN(k4v2)適用時は、この標準アテンション換算値に圧縮率(既定3/16)を掛けただけの単純推定であり、実機では固定オーバーヘッドや sliding window 層が対象外である影響で、
   短いコンテキストではむしろ悪化するケースが実測で確認されています(このツールの数値はあくまで目安、必ず実機検証してください)。<br>
   容量・アーキテクチャは各モデルの <code>/api/models/&lt;repo&gt;/tree/main</code> と <code>/&lt;repo&gt;/raw/main/config.json</code> を個別に叩いて取得。
@@ -372,32 +372,53 @@ async function fetchParamsB(repoId) {
 }
 
 function analyzeConfig(cfg) {
-  // returns { bytesPerTokenTotal, badges }
+  // returns { bytesPerTokenTotal, badges, fullAttnLayers, totalLayers }
   const raw = JSON.stringify(cfg).toLowerCase();
   const badges = [];
   if (/sliding_window|swa/.test(raw)) badges.push({ cls: "badge-sw", label: "sliding window検出" });
-  if (/linear_attention|delta_net|gated_delta|mamba|conv_kernel|linear_key|linear_value/.test(raw)) {
-    badges.push({ cls: "badge-gdn", label: "GDN/線形アテンション検出" });
-  }
+  const isHybrid = /linear_attention|delta_net|gated_delta|mamba|conv_kernel|linear_key|linear_value/.test(raw);
 
-  const numLayers = cfg.num_hidden_layers || cfg.n_layer || cfg.num_layers ||
-    (cfg.text_config && (cfg.text_config.num_hidden_layers)) || null;
-  const hiddenSize = cfg.hidden_size || cfg.n_embd || cfg.d_model ||
-    (cfg.text_config && cfg.text_config.hidden_size) || null;
-  const numAttnHeads = cfg.num_attention_heads || cfg.n_head ||
-    (cfg.text_config && cfg.text_config.num_attention_heads) || null;
-  const numKvHeads = cfg.num_key_value_heads ||
-    (cfg.text_config && cfg.text_config.num_key_value_heads) || numAttnHeads;
-  const headDim = cfg.head_dim ||
-    (cfg.text_config && cfg.text_config.head_dim) ||
+  const tc = cfg.text_config || {};
+  const numLayers = cfg.num_hidden_layers || cfg.n_layer || cfg.num_layers || tc.num_hidden_layers || null;
+  const hiddenSize = cfg.hidden_size || cfg.n_embd || cfg.d_model || tc.hidden_size || null;
+  const numAttnHeads = cfg.num_attention_heads || cfg.n_head || tc.num_attention_heads || null;
+  const numKvHeads = cfg.num_key_value_heads || tc.num_key_value_heads || numAttnHeads;
+  const headDim = cfg.head_dim || tc.head_dim ||
     (hiddenSize && numAttnHeads ? hiddenSize / numAttnHeads : null);
 
-  if (!numLayers || !numKvHeads || !headDim) {
-    return { bytesPerTokenTotal: null, badges };
+  // GDN/線形アテンションのハイブリッド構成では、KVキャッシュがトークン数に比例して
+  // 伸びるのはfull_attention層だけ(線形アテンション層は固定サイズ状態を持つのみ)。
+  // layer_types配列があれば実カウント、無ければfull_attention_intervalから概算する。
+  let fullAttnLayers = numLayers;
+  let fullAttnKnown = !isHybrid; // 非ハイブリッドならnumLayers全部で確定
+  const layerTypes = cfg.layer_types || tc.layer_types || null;
+  const interval = cfg.full_attention_interval || tc.full_attention_interval || null;
+  if (isHybrid && Array.isArray(layerTypes)) {
+    fullAttnLayers = layerTypes.filter(t => t === "full_attention").length;
+    fullAttnKnown = fullAttnLayers > 0;
+  } else if (isHybrid && interval && numLayers) {
+    fullAttnLayers = Math.floor(numLayers / interval);
+    fullAttnKnown = fullAttnLayers > 0;
+  } else if (isHybrid) {
+    fullAttnKnown = false; // GDN検出だが層数を特定できず、計算不可
+  }
+  if (isHybrid) {
+    badges.push({
+      cls: "badge-gdn",
+      label: fullAttnKnown
+        ? `GDN/線形アテンション検出(full-attn ${fullAttnLayers}/${numLayers}層)`
+        : "GDN/線形アテンション検出(full-attn層数不明)",
+    });
+  }
+
+  if (!numLayers || !numKvHeads || !headDim || !fullAttnKnown) {
+    return { bytesPerTokenTotal: null, badges, fullAttnLayers: null, totalLayers: numLayers };
   }
   return {
-    bytesPerTokenTotal: 2 * numLayers * numKvHeads * headDim, // ×dtypeバイト数は呼び出し側で掛ける
+    bytesPerTokenTotal: 2 * fullAttnLayers * numKvHeads * headDim, // ×dtypeバイト数は呼び出し側で掛ける
     badges,
+    fullAttnLayers,
+    totalLayers: numLayers,
   };
 }
 
