@@ -271,8 +271,7 @@ async function searchModels() {
 
     async function runQuery(searchTerm) {
       const params = buildSearchParams(searchTerm, fetchLimit, sortby);
-      const res = await fetch(`${API}?${params.toString()}`, { headers: authHeaders() });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const res = await fetchWithRetry(`${API}?${params.toString()}`);
       const data = await res.json();
       for (const m of data) {
         const id = m.modelId || m.id;
@@ -349,9 +348,29 @@ async function searchModels() {
   }
 }
 
+// 429(レート制限)なら Retry-After / ratelimit ヘッダーのリセット秒数を読んで待ってから
+// 1回だけ再試行する。HFの固定窓レート制限(例: 500件/300秒)は一括取得で普通に踏み抜くため、
+// 失敗即エラーではなくここで自動的に回復を試みる。
+async function fetchWithRetry(url, { maxRetries = 1 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status !== 429 || attempt >= maxRetries) {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    }
+    let waitSec = parseFloat(res.headers.get("Retry-After")) || null;
+    if (!waitSec) {
+      const rl = res.headers.get("ratelimit") || "";
+      const m = rl.match(/t=(\d+)/);
+      waitSec = m ? parseInt(m[1], 10) : 5;
+    }
+    setStatus(`HFのレート制限(429)。${waitSec}秒待って再試行します…`);
+    await new Promise(r => setTimeout(r, (waitSec + 1) * 1000));
+  }
+}
+
 async function fetchSize(repoId) {
-  const res = await fetch(`${API}/${repoId}/tree/main`, { headers: authHeaders() });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetchWithRetry(`${API}/${repoId}/tree/main`);
   const files = await res.json();
   if (!Array.isArray(files)) throw new Error("unexpected response");
   const total = files.reduce((sum, f) => sum + (f.type === "file" ? (f.size || 0) : 0), 0);
@@ -359,8 +378,7 @@ async function fetchSize(repoId) {
 }
 
 async function fetchConfig(repoId) {
-  const res = await fetch(`https://huggingface.co/${repoId}/raw/main/config.json`, { headers: authHeaders() });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetchWithRetry(`https://huggingface.co/${repoId}/raw/main/config.json`);
   return await res.json();
 }
 
@@ -373,12 +391,10 @@ function parseParamsBFromName(repoId) {
 async function fetchParamsB(repoId) {
   // HFのモデル情報APIにsafetensors.parameters(dtype別)/totalが入ってることがある(実測値、名前推定より優先)
   try {
-    const res = await fetch(`${API}/${repoId}?expand[]=safetensors`, { headers: authHeaders() });
-    if (res.ok) {
-      const info = await res.json();
-      const total = info?.safetensors?.total;
-      if (typeof total === "number" && total > 0) return total / 1e9;
-    }
+    const res = await fetchWithRetry(`${API}/${repoId}?expand[]=safetensors`);
+    const info = await res.json();
+    const total = info?.safetensors?.total;
+    if (typeof total === "number" && total > 0) return total / 1e9;
   } catch (e) { /* フォールバックへ */ }
   return parseParamsBFromName(repoId);
 }
@@ -452,9 +468,13 @@ async function fetchOne(idx) {
     row.perGpu = perGpuGiB;
     row.verdictRank = verdict(gb, tp, ceiling, overhead, marginalKvGiB).rank;
 
-    try {
-      row.paramsB = await fetchParamsB(row.id);
-    } catch (e) { /* パラメータ数は取れなくても致命的ではない */ }
+    // paramsBは検索直後の一括取得(paramsWorker)で既に入っていることが多い。
+    // 二重取得はAPI呼び出し回数を無駄に増やしレート制限を早める(1行3回→2回に削減)。
+    if (row.paramsB == null) {
+      try {
+        row.paramsB = await fetchParamsB(row.id);
+      } catch (e) { /* パラメータ数は取れなくても致命的ではない */ }
+    }
 
     const kvBudgetGiB = ceiling - perGpuGiB - overhead;
     try {
@@ -523,7 +543,7 @@ async function fetchAll() {
       setStatus(`サイズ・コンテキスト取得中… ${done}/${targets.length}`);
       await fetchOne(i);
       done++;
-      await new Promise(r => setTimeout(r, 150)); // gentle pacing, avoid hammering the API
+      await new Promise(r => setTimeout(r, 250)); // gentle pacing, avoid hammering the API
     }
   }
   setStatus(`完了: ${targets.length}件の取得を試行しました。(GGUF/MLX除外設定を反映)`);
