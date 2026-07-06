@@ -133,12 +133,24 @@
   </div>
   <div class="row" style="margin-top:.8rem;">
     <div class="checkrow">
-      <input type="checkbox" id="kvarn">
-      <label for="kvarn">KVarN(k4v2)適用時も計算</label>
+      <input type="checkbox" id="kvQuant">
+      <label for="kvQuant">KV量子化適用時も計算</label>
     </div>
     <div>
-      <label>KVarN圧縮率(既定 k4v2: 3/16 ≈ 0.1875)</label>
-      <input type="number" id="kvarnRatio" value="0.1875" step="0.01" min="0.01" max="1">
+      <label>プリセット</label>
+      <select id="kvPreset">
+        <option value="kvarn">KVarN k4v2 (K=4bit, V=2bit)</option>
+        <option value="oscar">OSCAR INT2 (K=2bit, V=2bit理論値。実測はsink/recent window等のオーバーヘッドで7.14倍程度)</option>
+        <option value="custom">カスタム(下のK/Vビットを直接編集)</option>
+      </select>
+    </div>
+    <div>
+      <label>Kビット/値</label>
+      <input type="number" id="kBits" value="4" step="0.5" min="0.5" max="16">
+    </div>
+    <div>
+      <label>Vビット/値</label>
+      <input type="number" id="vBits" value="2" step="0.5" min="0.5" max="16">
     </div>
     <div>
       <label>KVキャッシュdtype(baseline, byte/値)</label>
@@ -172,7 +184,7 @@
         <th data-key="perGpu">/GPU(GiB)</th>
         <th data-key="verdictRank">判定</th>
         <th data-key="ctxTokens">推定コンテキスト(標準アテンション換算)</th>
-        <th data-key="ctxTokensKvarn">KVarN適用時</th>
+        <th data-key="ctxTokensKvQuant">KV量子化適用時</th>
       </tr>
     </thead>
     <tbody id="tbody"></tbody>
@@ -187,7 +199,7 @@
   <code>KV予算(GiB) = VRAM上限 − 重み(/GPU) − 固定オーバーヘッド</code>、<code>推定最大トークン数 = KV予算 ÷ (1トークンあたりのKVバイト数/GPU)</code>。<br>
   <span class="badge badge-gdn">GDN/線形アテンション検出</span>の場合、KVキャッシュがトークン数に比例して伸びるのは<code>layer_types</code>(または<code>full_attention_interval</code>)から数えたfull-attention層だけであり、この<code>layers</code>には全層数ではなくfull-attention層数を使う(バッジに「full-attn X/Y層」と表示)。この判定ができない場合はコンテキスト推定不可として「-」表示。<br>
   <span class="badge badge-sw">sliding window検出</span>のモデルは実際はこの推定より多く入る場合がある(未補正)。<br>
-  KVarN(k4v2)適用時は、この標準アテンション換算値に圧縮率(既定3/16)を掛けただけの単純推定であり、実機では固定オーバーヘッドや sliding window 層が対象外である影響で、
+  KV量子化(KVarN/OSCAR等)適用時は、K/Vそれぞれのビット数を指定すると<code>圧縮率 = (Kビット+Vビット) / (baseline dtypeビット×2)</code>を自動計算し、上記の標準アテンション換算値に掛けただけの単純推定です。実機では固定オーバーヘッドやsliding window層が対象外である影響、OSCARのsink/recent window(bf16のまま残す小さな窓)によるオーバーヘッドなどで、
   短いコンテキストではむしろ悪化するケースが実測で確認されています(このツールの数値はあくまで目安、必ず実機検証してください)。<br>
   容量・アーキテクチャは各モデルの <code>/api/models/&lt;repo&gt;/tree/main</code> と <code>/&lt;repo&gt;/raw/main/config.json</code> を個別に叩いて取得。
   一覧表示は <code>/api/models?search=...</code> のメタデータのみで高速表示、詳細は「サイズ取得」ボタンで遅延取得。
@@ -296,7 +308,7 @@ async function searchModels() {
       verdictRank: -1,
       bytesPerTokenPerGpu: null,
       ctxTokens: null,
-      ctxTokensKvarn: null,
+      ctxTokensKvQuant: null,
       archBadges: [],
       configError: false,
       paramsB: null,
@@ -427,8 +439,10 @@ async function fetchOne(idx) {
   const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
   const overhead = parseFloat(document.getElementById("overhead").value) || 0;
   const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
-  const kvarnRatio = parseFloat(document.getElementById("kvarnRatio").value) || 0.1875;
   const dtypeBytes = parseFloat(document.getElementById("kvdtype").value) || 2;
+  const kBits = parseFloat(document.getElementById("kBits").value) || 4;
+  const vBits = parseFloat(document.getElementById("vBits").value) || 2;
+  const kvQuantRatio = (kBits + vBits) / (dtypeBytes * 8 * 2); // baselineはK+V各dtypeBytes*8ビット
   const row = results[idx];
 
   try {
@@ -452,10 +466,10 @@ async function fetchOne(idx) {
         row.bytesPerTokenPerGpu = bytesPerTokenPerGpu;
         const kvBudgetBytes = kvBudgetGiB * (1024 ** 3);
         row.ctxTokens = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / bytesPerTokenPerGpu) : 0;
-        row.ctxTokensKvarn = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / (bytesPerTokenPerGpu * kvarnRatio)) : 0;
+        row.ctxTokensKvQuant = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / (bytesPerTokenPerGpu * kvQuantRatio)) : 0;
       } else {
         row.ctxTokens = null;
-        row.ctxTokensKvarn = null;
+        row.ctxTokensKvQuant = null;
       }
     } catch (e) {
       row.configError = true;
@@ -521,8 +535,8 @@ function render() {
   const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
   const overhead = parseFloat(document.getElementById("overhead").value) || 0;
   const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
-  const showKvarn = document.getElementById("kvarn").checked;
-  document.querySelector('th[data-key="ctxTokensKvarn"]').style.display = showKvarn ? "" : "none";
+  const showKvQuant = document.getElementById("kvQuant").checked;
+  document.querySelector('th[data-key="ctxTokensKvQuant"]').style.display = showKvQuant ? "" : "none";
 
   const sorted = [...visibleResults()].sort((a, b) => {
     let av = a[sortState.key], bv = b[sortState.key];
@@ -598,11 +612,11 @@ function render() {
     }
     tr.appendChild(tdCtx);
 
-    const tdCtxKvarn = document.createElement("td");
-    tdCtxKvarn.className = "ctxcell";
-    tdCtxKvarn.style.display = showKvarn ? "" : "none";
-    tdCtxKvarn.textContent = row.ctxTokensKvarn != null ? fmtTokens(row.ctxTokensKvarn) + " tokens" : "-";
-    tr.appendChild(tdCtxKvarn);
+    const tdCtxKvQuant = document.createElement("td");
+    tdCtxKvQuant.className = "ctxcell";
+    tdCtxKvQuant.style.display = showKvQuant ? "" : "none";
+    tdCtxKvQuant.textContent = row.ctxTokensKvQuant != null ? fmtTokens(row.ctxTokensKvQuant) + " tokens" : "-";
+    tr.appendChild(tdCtxKvQuant);
 
     tbody.appendChild(tr);
   });
@@ -620,11 +634,21 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","ceiling","overhead","marginalKvGiB","kvarn","excludeGguf","excludeMlx","hideDead","minGb","minParamsB","maxParamsB"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","ceiling","overhead","marginalKvGiB","kvQuant","kBits","vBits","excludeGguf","excludeMlx","hideDead","minGb","minParamsB","maxParamsB"].forEach(id => document.getElementById(id).addEventListener("change", render));
 
 document.getElementById("engine").addEventListener("change", (e) => {
   if (e.target.value !== "custom") {
     document.getElementById("overhead").value = e.target.value;
+    render();
+  }
+});
+
+const KV_PRESETS = { kvarn: { k: 4, v: 2 }, oscar: { k: 2, v: 2 } };
+document.getElementById("kvPreset").addEventListener("change", (e) => {
+  const preset = KV_PRESETS[e.target.value];
+  if (preset) {
+    document.getElementById("kBits").value = preset.k;
+    document.getElementById("vBits").value = preset.v;
     render();
   }
 });
