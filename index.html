@@ -291,7 +291,33 @@ async function searchModels() {
       paramsB: null,
     }));
     render();
-    setStatus(`${results.length}件取得(表示${visibleResults().length}件)。サイズ・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
+    setStatus(`${results.length}件取得。パラメータ数・推定容量を取得中…`);
+    document.getElementById("fetchAllSizes").disabled = false;
+
+    // 検索直後にパラメータ数(実測、safetensors.total)を全件まとめて取得し、下限/上限フィルタを即座に効かせる。
+    // 容量(GB)はビット幅からの推定が本セッションで何度も実測と大きく乖離した実績があるため、
+    // 推定はせず「サイズ取得」ボタンでの実測のみを信用する。
+    let doneParams = 0;
+    const CONCURRENCY = 6;
+    let cursor = 0;
+    async function paramsWorker() {
+      while (cursor < results.length) {
+        const i = cursor++;
+        const row = results[i];
+        try {
+          row.paramsB = await fetchParamsB(row.id);
+        } catch (e) { /* このモデルだけスキップ */ }
+        doneParams++;
+        if (doneParams % 5 === 0 || doneParams === results.length) {
+          setStatus(`パラメータ数取得中… ${doneParams}/${results.length}`);
+          render();
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, results.length) }, paramsWorker));
+
+    render();
+    setStatus(`${results.length}件取得(表示${visibleResults().length}件)。実容量・コンテキストは「サイズ取得」ボタンで個別/一括取得してください。`);
     document.getElementById("fetchAllSizes").disabled = visibleResults().length === 0;
   } catch (e) {
     setStatus("検索失敗: " + e.message);
@@ -315,8 +341,14 @@ async function fetchConfig(repoId) {
   return await res.json();
 }
 
+function parseParamsBFromName(repoId) {
+  // リポジトリ名から "7B" / "3.5B" 等のパターンを推定(不確実、参考値。検索直後の即時フィルタ用)
+  const m = repoId.match(/(\d+(?:\.\d+)?)\s*[Bb](?![a-zA-Z])/);
+  return m ? parseFloat(m[1]) : null;
+}
+
 async function fetchParamsB(repoId) {
-  // HFのモデル情報APIにsafetensors.parameters(dtype別)/totalが入ってることがある(実測値)
+  // HFのモデル情報APIにsafetensors.parameters(dtype別)/totalが入ってることがある(実測値、名前推定より優先)
   try {
     const res = await fetch(`${API}/${repoId}?expand[]=safetensors`);
     if (res.ok) {
@@ -325,10 +357,7 @@ async function fetchParamsB(repoId) {
       if (typeof total === "number" && total > 0) return total / 1e9;
     }
   } catch (e) { /* フォールバックへ */ }
-  // フォールバック: リポジトリ名から "7B" / "3.5B" 等のパターンを推定(不確実、参考値)
-  const m = repoId.match(/(\d+(?:\.\d+)?)\s*[Bb](?![a-zA-Z])/);
-  if (m) return parseFloat(m[1]);
-  return null;
+  return parseParamsBFromName(repoId);
 }
 
 function analyzeConfig(cfg) {
