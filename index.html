@@ -112,12 +112,8 @@
       <input type="number" id="minGb" value="0" step="0.5" min="0">
     </div>
     <div>
-      <label>安全圏しきい値(合計GB)</label>
-      <input type="number" id="safeGb" value="16" step="0.5">
-    </div>
-    <div>
-      <label>境界しきい値(合計GB)</label>
-      <input type="number" id="marginalGb" value="18" step="0.5">
+      <label>境界とみなすKV余白の下限(GiB)</label>
+      <input type="number" id="marginalKvGiB" value="1.5" step="0.1" min="0">
     </div>
     <div><button class="secondary" id="fetchAllSizes" disabled>表示中の全件サイズ+コンテキスト取得</button></div>
   </div>
@@ -180,7 +176,7 @@
 </div>
 
 <div class="footer-note">
-  容量判定基準(既定値、上のフォームで調整可): 合計実容量が「安全圏しきい値」以下=安全、「境界しきい値」以下=境界、それ以上=却下相当。<br>
+  容量判定基準: コンテキスト推定と同じ計算(KV余白 = VRAM上限 − 重み(/GPU) − 固定オーバーヘッド)を使う。KV余白が0以下=却下(容量超過で起動不可)、「境界とみなすKV余白の下限」以下=境界(起動はするがコンテキストが僅か)、それより余裕があれば安全圏。TP・上限・オーバーヘッドを変えると判定も連動して変わる。<br>
   /GPU値は 合計実容量 ÷ TP数(単純折半、実際はレイヤーの重複等でズレることがあるため目安)。<br>
   <b>コンテキスト推定の計算式</b>: config.jsonから num_hidden_layers・num_attention_heads・num_key_value_heads(GQA、無ければ num_attention_heads と同じ)・hidden_size を取得し、<br>
   <code>1トークンあたりのKVバイト数(全GPU合計) = 2(K+V) × layers × kv_heads × head_dim × dtypeバイト数</code>、これをTPで割って1GPUあたりに換算。<br>
@@ -212,11 +208,16 @@ function fmtTokens(n) {
   return String(Math.floor(n));
 }
 
-function verdict(totalGb, safeGb, marginalGb) {
-  if (totalGb == null) return { label: "未取得", cls: "v-unknown", rank: -1 };
-  if (totalGb <= safeGb) return { label: "安全圏", cls: "v-safe", rank: 0 };
-  if (totalGb <= marginalGb) return { label: "境界", cls: "v-marginal", rank: 1 };
-  return { label: "却下", cls: "v-dead", rank: 2 };
+// 判定はコンテキスト計算と同じ「実際のKV余白(GiB)」で行う(容量GBの独立したしきい値ではない)。
+// kvBudgetGiB = 1GPUあたりVRAM上限 − 重み(/GPU) − 固定オーバーヘッド。
+function verdict(sizeGb, tp, ceiling, overhead, marginalKvGiB) {
+  if (sizeGb == null) return { label: "未取得", cls: "v-unknown", rank: -1 };
+  if (sizeGb < 0) return { label: "取得失敗", cls: "v-unknown", rank: -1 };
+  const perGpuGiB = (sizeGb / tp) * (1e9 / (1024 ** 3));
+  const kvBudgetGiB = ceiling - overhead - perGpuGiB;
+  if (kvBudgetGiB <= 0) return { label: "却下(容量超過)", cls: "v-dead", rank: 2, kvBudgetGiB };
+  if (kvBudgetGiB <= marginalKvGiB) return { label: "境界(KV僅か)", cls: "v-marginal", rank: 1, kvBudgetGiB };
+  return { label: "安全圏", cls: "v-safe", rank: 0, kvBudgetGiB };
 }
 
 function setStatus(msg) { document.getElementById("status").textContent = msg; }
@@ -364,8 +365,7 @@ async function fetchOne(idx) {
   const tp = parseFloat(document.getElementById("tp").value) || 2;
   const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
   const overhead = parseFloat(document.getElementById("overhead").value) || 0;
-  const safeGb = parseFloat(document.getElementById("safeGb").value);
-  const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
   const kvarnRatio = parseFloat(document.getElementById("kvarnRatio").value) || 0.1875;
   const dtypeBytes = parseFloat(document.getElementById("kvdtype").value) || 2;
   const row = results[idx];
@@ -375,7 +375,7 @@ async function fetchOne(idx) {
     row.sizeGb = gb;
     const perGpuGiB = (gb / tp) * (1e9 / (1024 ** 3));
     row.perGpu = perGpuGiB;
-    row.verdictRank = verdict(gb, safeGb, marginalGb).rank;
+    row.verdictRank = verdict(gb, tp, ceiling, overhead, marginalKvGiB).rank;
 
     try {
       row.paramsB = await fetchParamsB(row.id);
@@ -416,15 +416,17 @@ function isExcludedFormat(row) {
 
 function visibleResults() {
   const hideDead = document.getElementById("hideDead").checked;
-  const safeGb = parseFloat(document.getElementById("safeGb").value);
-  const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const tp = parseFloat(document.getElementById("tp").value) || 2;
+  const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
+  const overhead = parseFloat(document.getElementById("overhead").value) || 0;
+  const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
   const minGb = parseFloat(document.getElementById("minGb").value) || 0;
   const minParamsB = parseFloat(document.getElementById("minParamsB").value);
   const maxParamsB = parseFloat(document.getElementById("maxParamsB").value);
   return results.filter(r => {
     if (isExcludedFormat(r)) return false;
     // しきい値変更後も最新の判定でフィルタする(fetch時点のverdictRankは使わない)
-    if (hideDead && r.sizeGb != null && r.sizeGb >= 0 && verdict(r.sizeGb, safeGb, marginalGb).rank === 2) return false;
+    if (hideDead && r.sizeGb != null && r.sizeGb >= 0 && verdict(r.sizeGb, tp, ceiling, overhead, marginalKvGiB).rank === 2) return false;
     // 最小容量未満は除外(サイズ未取得のものは判定できないので通す)
     if (minGb > 0 && r.sizeGb != null && r.sizeGb >= 0 && r.sizeGb < minGb) return false;
     // パラメータ数の範囲外は除外(未取得のものは通す)
@@ -453,8 +455,9 @@ async function fetchAll() {
 
 function render() {
   const tp = parseFloat(document.getElementById("tp").value) || 2;
-  const safeGb = parseFloat(document.getElementById("safeGb").value);
-  const marginalGb = parseFloat(document.getElementById("marginalGb").value);
+  const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
+  const overhead = parseFloat(document.getElementById("overhead").value) || 0;
+  const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
   const showKvarn = document.getElementById("kvarn").checked;
   document.querySelector('th[data-key="ctxTokensKvarn"]').style.display = showKvarn ? "" : "none";
 
@@ -513,8 +516,9 @@ function render() {
 
     const tdVerdict = document.createElement("td");
     if (row.sizeGb != null && row.sizeGb >= 0) {
-      const v = verdict(row.sizeGb, safeGb, marginalGb);
-      tdVerdict.innerHTML = `<span class="verdict ${v.cls}">${v.label}</span>`;
+      const v = verdict(row.sizeGb, tp, ceiling, overhead, marginalKvGiB);
+      const kvLabel = v.kvBudgetGiB != null ? ` (${v.kvBudgetGiB.toFixed(2)}GiB)` : "";
+      tdVerdict.innerHTML = `<span class="verdict ${v.cls}">${v.label}${kvLabel}</span>`;
     } else {
       tdVerdict.innerHTML = `<span class="verdict v-unknown">未取得</span>`;
     }
@@ -553,7 +557,7 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 document.getElementById("searchBtn").addEventListener("click", searchModels);
 document.getElementById("fetchAllSizes").addEventListener("click", fetchAll);
 document.getElementById("kw").addEventListener("keydown", e => { if (e.key === "Enter") searchModels(); });
-["tp","safeGb","marginalGb","kvarn","excludeGguf","excludeMlx","hideDead","minGb","minParamsB","maxParamsB"].forEach(id => document.getElementById(id).addEventListener("change", render));
+["tp","ceiling","overhead","marginalKvGiB","kvarn","excludeGguf","excludeMlx","hideDead","minGb","minParamsB","maxParamsB"].forEach(id => document.getElementById(id).addEventListener("change", render));
 
 document.getElementById("engine").addEventListener("change", (e) => {
   if (e.target.value !== "custom") {
