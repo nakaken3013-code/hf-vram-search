@@ -69,7 +69,7 @@
   <div class="row">
     <div>
       <label>キーワード検索</label>
-      <input type="text" id="kw" placeholder="スペース区切りで全部AND一致(例: 3.6 27B)" value="japanese awq">
+      <input type="text" id="kw" placeholder="スペース区切りで全部AND一致(例: 3.6 27B)" value="">
     </div>
     <div>
       <label>件数</label>
@@ -170,6 +170,11 @@
     </div>
   </div>
   <div id="status"></div>
+  <div class="row" style="margin-top:.6rem; align-items:center;">
+    <span class="muted" id="cacheStatus">キャッシュ: -</span>
+    <button class="fetchbtn" id="exportSeed" title="現在のキャッシュをseed.jsonとして書き出し(リポにcommitすれば全員の初期データになる)">シード書き出し(JSON)</button>
+    <button class="fetchbtn" id="clearCache" title="このブラウザに保存した取得キャッシュを全消去">キャッシュクリア</button>
+  </div>
 </div>
 
 <div class="panel" style="overflow-x:auto;">
@@ -209,6 +214,112 @@
 const API = "https://huggingface.co/api/models";
 let results = [];
 let sortState = { key: "downloads", dir: -1 };
+
+// ============================================================================
+// 取得結果キャッシュ (IndexedDB)。モデルごとの「重い取得」= 実サイズ(tree/main)・
+// config由来のKV情報・パラメータ数 を保存し、再検索時はHFを叩かず即表示する
+// (429レート制限回避 & 高速化)。TP/上限/量子化などの設定に依存する判定・コンテキスト
+// トークン数はキャッシュせず毎回 recomputeRow() で計算する(設定を変えれば即反映)。
+// 保存する派生値は kvBytesPerTokenTotal = 2×full_attn層数×kv_heads×head_dim (dtype・TP非依存)。
+// ============================================================================
+const DB_NAME = "hfVramCache", STORE = "models", DB_VER = 1;
+let _db = null;
+function openDB() {
+  return new Promise((resolve) => {
+    let req;
+    try { req = indexedDB.open(DB_NAME, DB_VER); }
+    catch (e) { resolve(null); return; }
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE, { keyPath: "id" }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  });
+}
+function cacheGet(id) {
+  return new Promise((resolve) => {
+    if (!_db) return resolve(null);
+    const r = _db.transaction(STORE, "readonly").objectStore(STORE).get(id);
+    r.onsuccess = () => resolve(r.result || null);
+    r.onerror = () => resolve(null);
+  });
+}
+async function cacheSet(id, partial) {
+  if (!_db) return;
+  const existing = (await cacheGet(id)) || { id };
+  const merged = { ...existing, ...partial, id, ts: Date.now() };
+  return new Promise((resolve) => {
+    const r = _db.transaction(STORE, "readwrite").objectStore(STORE).put(merged);
+    r.onsuccess = () => resolve(); r.onerror = () => resolve();
+  });
+}
+function cacheAll() {
+  return new Promise((resolve) => {
+    if (!_db) return resolve([]);
+    const r = _db.transaction(STORE, "readonly").objectStore(STORE).getAll();
+    r.onsuccess = () => resolve(r.result || []); r.onerror = () => resolve([]);
+  });
+}
+function cacheClearAll() {
+  return new Promise((resolve) => {
+    if (!_db) return resolve();
+    const r = _db.transaction(STORE, "readwrite").objectStore(STORE).clear();
+    r.onsuccess = () => resolve(); r.onerror = () => resolve();
+  });
+}
+async function updateCacheStatus() {
+  const all = await cacheAll();
+  const withSize = all.filter(e => typeof e.sizeGb === "number" && e.sizeGb >= 0).length;
+  const el = document.getElementById("cacheStatus");
+  if (el) el.textContent = `キャッシュ: ${all.length}件 (実サイズ有 ${withSize}件)`;
+}
+// 起動時にリポ同梱の共有シードを読み込む。既存の個人キャッシュは上書きしない(自分の取得を優先)。
+async function loadSeed() {
+  try {
+    const res = await fetch("seed.json", { cache: "no-cache" });
+    if (!res.ok) return;
+    const seed = await res.json();
+    if (!Array.isArray(seed)) return;
+    for (const entry of seed) {
+      if (!entry || !entry.id) continue;
+      if (!(await cacheGet(entry.id))) await cacheSet(entry.id, entry);
+    }
+  } catch (e) { /* seed.json が無ければ何もしない */ }
+}
+
+// 現在のUI設定をまとめて読む(あちこちのgetElementByIdを一箇所に集約)。
+function readSettings() {
+  return {
+    tp: parseFloat(document.getElementById("tp").value) || 2,
+    ceiling: parseFloat(document.getElementById("ceiling").value) || 10.6,
+    overhead: parseFloat(document.getElementById("overhead").value) || 0,
+    marginalKvGiB: parseFloat(document.getElementById("marginalKvGiB").value) || 0,
+    dtypeBytes: parseFloat(document.getElementById("kvdtype").value) || 2,
+    kBits: parseFloat(document.getElementById("kBits").value) || 4,
+    vBits: parseFloat(document.getElementById("vBits").value) || 2,
+  };
+}
+
+// 保存済み(サイズ・config由来)の値と現在の設定から、表示・ソートに使う派生値を計算する。
+// 設定依存なので毎回計算する(render前に全行に対して呼ぶ)。
+function recomputeRow(row) {
+  const s = readSettings();
+  if (row.sizeGb == null || row.sizeGb < 0) {
+    row.perGpu = null; row.verdictRank = row.sizeGb === -1 ? -1 : (row.verdictRank ?? -1);
+    row.ctxTokens = null; row.ctxTokensKvQuant = null;
+    return;
+  }
+  row.perGpu = (row.sizeGb / s.tp) * (1e9 / (1024 ** 3));
+  const v = verdict(row.sizeGb, s.tp, s.ceiling, s.overhead, s.marginalKvGiB);
+  row.verdictRank = v.rank;
+  const kvBudgetBytes = (s.ceiling - s.overhead - row.perGpu) * (1024 ** 3);
+  if (row.kvBytesPerTokenTotal) {
+    const perGpuBytes = (row.kvBytesPerTokenTotal * s.dtypeBytes) / s.tp;
+    const ratio = (s.kBits + s.vBits) / (s.dtypeBytes * 8 * 2);
+    row.ctxTokens = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / perGpuBytes) : 0;
+    row.ctxTokensKvQuant = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / (perGpuBytes * ratio)) : 0;
+  } else {
+    row.ctxTokens = null; row.ctxTokensKvQuant = null;
+  }
+}
 
 // HFトークンがあれば認証ヘッダーを付与する(匿名IPレート制限回避)。
 // トークンはこのブラウザのlocalStorageにのみ保存、サーバーには一切送らない。
@@ -305,7 +416,7 @@ async function searchModels() {
       sizeGb: null,
       perGpu: null,
       verdictRank: -1,
-      bytesPerTokenPerGpu: null,
+      kvBytesPerTokenTotal: undefined, // config由来、undefined=未取得 / null=推定不可 / 数値=算出済
       ctxTokens: null,
       ctxTokensKvQuant: null,
       archBadges: [],
@@ -313,7 +424,12 @@ async function searchModels() {
       paramsB: null,
     }));
     render();
-    setStatus(`${results.length}件取得。パラメータ数・推定容量を取得中…`);
+    // キャッシュ(seed含む)から即ハイドレート: 取得済みモデルはHFを叩かずサイズ/config/paramsを埋める。
+    // これによりVRAMに入らないモデルはこの時点で「却下」判定が出て hideDead で一覧から消える。
+    await hydrateFromCache();
+    render();
+    updateCacheStatus();
+    setStatus(`${results.length}件取得。未キャッシュ分のパラメータ数を取得中…`);
     document.getElementById("fetchAllSizes").disabled = false;
 
     // 検索直後にパラメータ数(実測、safetensors.total)を全件まとめて取得し、下限/上限フィルタを即座に効かせる。
@@ -389,14 +505,20 @@ function parseParamsBFromName(repoId) {
 }
 
 async function fetchParamsB(repoId) {
+  const cached = await cacheGet(repoId);
+  if (cached && typeof cached.paramsB === "number") return cached.paramsB;
   // HFのモデル情報APIにsafetensors.parameters(dtype別)/totalが入ってることがある(実測値、名前推定より優先)
   try {
     const res = await fetchWithRetry(`${API}/${repoId}?expand[]=safetensors`);
     const info = await res.json();
     const total = info?.safetensors?.total;
-    if (typeof total === "number" && total > 0) return total / 1e9;
+    if (typeof total === "number" && total > 0) {
+      const b = total / 1e9;
+      await cacheSet(repoId, { paramsB: b });
+      return b;
+    }
   } catch (e) { /* フォールバックへ */ }
-  return parseParamsBFromName(repoId);
+  return parseParamsBFromName(repoId); // 名前推定は不確実なのでキャッシュしない
 }
 
 function analyzeConfig(cfg) {
@@ -451,53 +573,50 @@ function analyzeConfig(cfg) {
 }
 
 async function fetchOne(idx) {
-  const tp = parseFloat(document.getElementById("tp").value) || 2;
-  const ceiling = parseFloat(document.getElementById("ceiling").value) || 10.6;
-  const overhead = parseFloat(document.getElementById("overhead").value) || 0;
-  const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
-  const dtypeBytes = parseFloat(document.getElementById("kvdtype").value) || 2;
-  const kBits = parseFloat(document.getElementById("kBits").value) || 4;
-  const vBits = parseFloat(document.getElementById("vBits").value) || 2;
-  const kvQuantRatio = (kBits + vBits) / (dtypeBytes * 8 * 2); // baselineはK+V各dtypeBytes*8ビット
   const row = results[idx];
+  let hitNetwork = false;
+  const cached = await cacheGet(row.id);
 
   try {
-    const gb = await fetchSize(row.id);
-    row.sizeGb = gb;
-    const perGpuGiB = (gb / tp) * (1e9 / (1024 ** 3));
-    row.perGpu = perGpuGiB;
-    row.verdictRank = verdict(gb, tp, ceiling, overhead, marginalKvGiB).rank;
-
-    // paramsBは検索直後の一括取得(paramsWorker)で既に入っていることが多い。
-    // 二重取得はAPI呼び出し回数を無駄に増やしレート制限を早める(1行3回→2回に削減)。
-    if (row.paramsB == null) {
-      try {
-        row.paramsB = await fetchParamsB(row.id);
-      } catch (e) { /* パラメータ数は取れなくても致命的ではない */ }
+    // 実サイズ(tree/main): キャッシュ優先、無ければ取得して保存
+    if (cached && typeof cached.sizeGb === "number" && cached.sizeGb >= 0) {
+      row.sizeGb = cached.sizeGb;
+    } else {
+      hitNetwork = true;
+      row.sizeGb = await fetchSize(row.id);
+      await cacheSet(row.id, { sizeGb: row.sizeGb });
     }
 
-    const kvBudgetGiB = ceiling - perGpuGiB - overhead;
-    try {
-      const cfg = await fetchConfig(row.id);
-      const { bytesPerTokenTotal, badges } = analyzeConfig(cfg);
-      row.archBadges = badges;
-      if (bytesPerTokenTotal) {
-        const bytesPerTokenPerGpu = (bytesPerTokenTotal * dtypeBytes) / tp;
-        row.bytesPerTokenPerGpu = bytesPerTokenPerGpu;
-        const kvBudgetBytes = kvBudgetGiB * (1024 ** 3);
-        row.ctxTokens = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / bytesPerTokenPerGpu) : 0;
-        row.ctxTokensKvQuant = kvBudgetBytes > 0 ? Math.floor(kvBudgetBytes / (bytesPerTokenPerGpu * kvQuantRatio)) : 0;
-      } else {
-        row.ctxTokens = null;
-        row.ctxTokensKvQuant = null;
+    // paramsB(fetchParamsB自体がキャッシュ優先)。既に入っていれば叩かない。
+    if (row.paramsB == null) {
+      try { row.paramsB = await fetchParamsB(row.id); } catch (e) { /* 非致命 */ }
+    }
+
+    // config由来のKV情報: キャッシュ優先。成功時のみ保存(例外時は保存せず次回リトライ)。
+    // kvBytesPerTokenTotal は null もあり得る(アーキ不明で推定不可)= 既知の不可なので保存してよい。
+    if (cached && cached.kvBytesPerTokenTotal !== undefined) {
+      row.kvBytesPerTokenTotal = cached.kvBytesPerTokenTotal;
+      row.archBadges = cached.badges || [];
+      row.configError = false;
+    } else {
+      try {
+        hitNetwork = true;
+        const cfg = await fetchConfig(row.id);
+        const { bytesPerTokenTotal, badges } = analyzeConfig(cfg);
+        row.kvBytesPerTokenTotal = bytesPerTokenTotal;
+        row.archBadges = badges;
+        row.configError = false;
+        await cacheSet(row.id, { kvBytesPerTokenTotal: bytesPerTokenTotal, badges });
+      } catch (e) {
+        row.configError = true; // 保存しない(次回リトライ可能に)
       }
-    } catch (e) {
-      row.configError = true;
     }
   } catch (e) {
-    row.sizeGb = -1; // marks fetch error
+    row.sizeGb = -1; // 取得失敗マーク(保存しない、再取得ボタンでリトライ可)
   }
   render();
+  updateCacheStatus();
+  return hitNetwork;
 }
 
 function isExcludedFormat(row) {
@@ -531,23 +650,40 @@ function visibleResults() {
   });
 }
 
+// 検索結果の各行を、HFを叩かずキャッシュ(seed含む)の値で埋める。
+async function hydrateFromCache() {
+  await Promise.all(results.map(async (row) => {
+    const c = await cacheGet(row.id);
+    if (!c) return;
+    if (typeof c.sizeGb === "number" && c.sizeGb >= 0) row.sizeGb = c.sizeGb;
+    if (typeof c.paramsB === "number") row.paramsB = c.paramsB;
+    if (c.kvBytesPerTokenTotal !== undefined) {
+      row.kvBytesPerTokenTotal = c.kvBytesPerTokenTotal;
+      row.archBadges = c.badges || [];
+    }
+  }));
+}
+
 async function fetchAll() {
   document.getElementById("fetchAllSizes").disabled = true;
   const targets = visibleResults();
   let done = 0;
   for (const row of targets) {
     const i = results.indexOf(row);
-    // sizeGb === -1 は前回失敗のマーク。再取得ボタンで毎回リトライできるよう、
-    // 「未取得」だけでなく「前回失敗」も対象に含める。
-    if (results[i].sizeGb == null || results[i].sizeGb < 0) {
+    const r = results[i];
+    // 未取得(サイズnull) / 前回失敗(sizeGb<0) / configだけ未取得(kv…===undefined) を対象にする。
+    // fetchOneはキャッシュ優先なので、キャッシュ済み部分はネットを叩かない。
+    const needs = r.sizeGb == null || r.sizeGb < 0 || r.kvBytesPerTokenTotal === undefined;
+    if (needs) {
       setStatus(`サイズ・コンテキスト取得中… ${done}/${targets.length}`);
-      await fetchOne(i);
+      const hitNetwork = await fetchOne(i);
       done++;
-      await new Promise(r => setTimeout(r, 250)); // gentle pacing, avoid hammering the API
+      if (hitNetwork) await new Promise(r => setTimeout(r, 250)); // ネット取得時のみ節度あるペース
     }
   }
   setStatus(`完了: ${targets.length}件の取得を試行しました。(GGUF/MLX除外設定を反映)`);
   document.getElementById("fetchAllSizes").disabled = false;
+  updateCacheStatus();
 }
 
 function render() {
@@ -557,6 +693,9 @@ function render() {
   const marginalKvGiB = parseFloat(document.getElementById("marginalKvGiB").value) || 0;
   const showKvQuant = document.getElementById("kvQuant").checked;
   document.querySelector('th[data-key="ctxTokensKvQuant"]').style.display = showKvQuant ? "" : "none";
+
+  // 保存済みの値+現在の設定から、判定/コンテキスト等の派生値を毎回計算しなおす。
+  results.forEach(recomputeRow);
 
   const sorted = [...visibleResults()].sort((a, b) => {
     let av = a[sortState.key], bv = b[sortState.key];
@@ -682,7 +821,34 @@ hfTokenInput.addEventListener("change", () => {
   else localStorage.removeItem("hfVramSearchToken");
 });
 
-searchModels();
+// キャッシュ操作ボタン
+document.getElementById("clearCache").addEventListener("click", async () => {
+  if (!confirm("このブラウザに保存した取得キャッシュを全消去します。よろしいですか?")) return;
+  await cacheClearAll();
+  await updateCacheStatus();
+  setStatus("キャッシュを消去しました。");
+});
+document.getElementById("exportSeed").addEventListener("click", async () => {
+  const all = await cacheAll();
+  // 実データのある行だけ書き出す(サイズ実測 or config由来が取れているもの)。
+  const seed = all
+    .filter(e => (typeof e.sizeGb === "number" && e.sizeGb >= 0) || e.kvBytesPerTokenTotal !== undefined)
+    .map(e => ({ id: e.id, sizeGb: e.sizeGb, paramsB: e.paramsB, kvBytesPerTokenTotal: e.kvBytesPerTokenTotal, badges: e.badges }));
+  const blob = new Blob([JSON.stringify(seed)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "seed.json"; a.click();
+  URL.revokeObjectURL(url);
+  setStatus(`seed.json を書き出しました(${seed.length}件)。リポ直下にcommitすると全員の初期データになります。`);
+});
+
+// 起動: IndexedDBを開き、リポ同梱のseed.jsonを読み込んでから初回検索。
+(async () => {
+  _db = await openDB();
+  await loadSeed();
+  await updateCacheStatus();
+  searchModels();
+})();
 </script>
 </body>
 </html>
